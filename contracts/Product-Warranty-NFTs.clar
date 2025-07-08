@@ -13,6 +13,11 @@
 (define-constant ERR-INVALID-SELLER (err u107))
 (define-constant ERR-INVALID-PRODUCT (err u108))
 
+
+(define-constant ERR-INSUFFICIENT-PAYMENT (err u109))
+(define-constant ERR-EXTENSION-NOT-AVAILABLE (err u110))
+(define-constant ERR-UPGRADE-NOT-AVAILABLE (err u111))
+
 (define-map warranties
   uint
   {
@@ -302,5 +307,114 @@
     (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
     (var-set contract-owner new-owner)
     (ok true)
+  )
+)
+
+(define-map warranty-upgrades
+  {seller: principal, product-id: (string-ascii 64)}
+  {
+    extension-price-per-block: uint,
+    premium-upgrade-price: uint,
+    premium-features: (string-ascii 128),
+    max-extensions: uint
+  }
+)
+
+(define-map warranty-extensions
+  uint
+  {
+    original-duration: uint,
+    total-extensions: uint,
+    extension-history: (list 5 uint),
+    upgraded-type: (string-ascii 32),
+    upgrade-block: uint
+  }
+)
+
+(define-read-only (get-upgrade-options (seller principal) (product-id (string-ascii 64)))
+  (map-get? warranty-upgrades {seller: seller, product-id: product-id})
+)
+
+(define-read-only (get-extension-history (warranty-id uint))
+  (map-get? warranty-extensions warranty-id)
+)
+
+(define-public (set-upgrade-options (product-id (string-ascii 64)) (extension-price uint) (premium-price uint) (premium-features (string-ascii 128)) (max-extensions uint))
+  (begin
+    (asserts! (is-some (map-get? seller-profiles tx-sender)) ERR-INVALID-SELLER)
+    (asserts! (is-some (map-get? product-registry product-id)) ERR-INVALID-PRODUCT)
+    (map-set warranty-upgrades {seller: tx-sender, product-id: product-id} {
+      extension-price-per-block: extension-price,
+      premium-upgrade-price: premium-price,
+      premium-features: premium-features,
+      max-extensions: max-extensions
+    })
+    (ok true)
+  )
+)
+
+(define-public (extend-warranty (warranty-id uint) (additional-blocks uint))
+  (match (map-get? warranties warranty-id)
+    warranty
+    (match (nft-get-owner? warranty-nft warranty-id)
+      owner
+      (begin
+        (asserts! (is-eq tx-sender owner) ERR-NOT-AUTHORIZED)
+        (asserts! (is-warranty-valid warranty-id) ERR-WARRANTY-EXPIRED)
+        (match (map-get? warranty-upgrades {seller: (get seller warranty), product-id: (get product-id warranty)})
+          upgrade-options
+          (let ((extension-cost (* (get extension-price-per-block upgrade-options) additional-blocks))
+                (current-extensions (default-to {original-duration: (get duration-blocks warranty), total-extensions: u0, extension-history: (list), upgraded-type: "", upgrade-block: u0} (map-get? warranty-extensions warranty-id))))
+            (begin
+              (asserts! (< (get total-extensions current-extensions) (get max-extensions upgrade-options)) ERR-EXTENSION-NOT-AVAILABLE)
+              (try! (stx-transfer? extension-cost tx-sender (get seller warranty)))
+              (map-set warranties warranty-id (merge warranty {
+                duration-blocks: (+ (get duration-blocks warranty) additional-blocks)
+              }))
+              (map-set warranty-extensions warranty-id (merge current-extensions {
+                total-extensions: (+ (get total-extensions current-extensions) u1),
+                extension-history: (unwrap-panic (as-max-len? (append (get extension-history current-extensions) additional-blocks) u5))
+              }))
+              (ok true)
+            )
+          )
+          ERR-EXTENSION-NOT-AVAILABLE
+        )
+      )
+      ERR-NFT-NOT-FOUND
+    )
+    ERR-NFT-NOT-FOUND
+  )
+)
+
+(define-public (upgrade-warranty (warranty-id uint) (new-type (string-ascii 32)))
+  (match (map-get? warranties warranty-id)
+    warranty
+    (match (nft-get-owner? warranty-nft warranty-id)
+      owner
+      (begin
+        (asserts! (is-eq tx-sender owner) ERR-NOT-AUTHORIZED)
+        (asserts! (is-warranty-valid warranty-id) ERR-WARRANTY-EXPIRED)
+        (match (map-get? warranty-upgrades {seller: (get seller warranty), product-id: (get product-id warranty)})
+          upgrade-options
+          (let ((upgrade-cost (get premium-upgrade-price upgrade-options))
+                (current-extensions (default-to {original-duration: (get duration-blocks warranty), total-extensions: u0, extension-history: (list), upgraded-type: "", upgrade-block: u0} (map-get? warranty-extensions warranty-id))))
+            (begin
+              (asserts! (is-eq (get upgraded-type current-extensions) "") ERR-UPGRADE-NOT-AVAILABLE)
+              (try! (stx-transfer? upgrade-cost tx-sender (get seller warranty)))
+              (map-set warranties warranty-id (merge warranty {warranty-type: new-type}))
+              (map-set warranty-extensions warranty-id (merge current-extensions {
+                upgraded-type: new-type,
+                upgrade-block: stacks-block-height
+              }))
+              (ok true)
+            )
+          )
+          ERR-UPGRADE-NOT-AVAILABLE
+        )
+      )
+      ERR-NFT-NOT-FOUND
+    )
+    ERR-NFT-NOT-FOUND
   )
 )
