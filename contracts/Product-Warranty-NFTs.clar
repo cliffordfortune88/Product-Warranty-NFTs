@@ -18,6 +18,11 @@
 (define-constant ERR-EXTENSION-NOT-AVAILABLE (err u110))
 (define-constant ERR-UPGRADE-NOT-AVAILABLE (err u111))
 
+(define-constant ERR-INSUFFICIENT-POOL-FUNDS (err u109))
+(define-constant ERR-POOL-NOT-FOUND (err u110))
+(define-constant ERR-INVALID-CONTRIBUTION (err u111))
+(define-constant ERR-WITHDRAWAL-DENIED (err u112))
+
 (define-map warranties
   uint
   {
@@ -416,5 +421,112 @@
       ERR-NFT-NOT-FOUND
     )
     ERR-NFT-NOT-FOUND
+  )
+)
+
+
+(define-map insurance-pools
+  (string-ascii 32)
+  {
+    total-funds: uint,
+    total-contributors: uint,
+    claims-paid: uint,
+    pool-active: bool
+  }
+)
+
+(define-map pool-contributions
+  {contributor: principal, category: (string-ascii 32)}
+  {
+    amount: uint,
+    join-block: uint,
+    rewards-earned: uint,
+    active: bool
+  }
+)
+
+(define-read-only (get-pool-status (category (string-ascii 32)))
+  (map-get? insurance-pools category)
+)
+
+(define-read-only (get-contribution-info (contributor principal) (category (string-ascii 32)))
+  (map-get? pool-contributions {contributor: contributor, category: category})
+)
+
+(define-read-only (calculate-pool-share (contributor principal) (category (string-ascii 32)))
+  (match (map-get? pool-contributions {contributor: contributor, category: category})
+    contribution
+    (match (map-get? insurance-pools category)
+      pool
+      (if (> (get total-funds pool) u0)
+        (ok (/ (* (get amount contribution) u10000) (get total-funds pool)))
+        (ok u0)
+      )
+      (ok u0)
+    )
+    (ok u0)
+  )
+)
+
+(define-public (contribute-to-pool (category (string-ascii 32)) (amount uint))
+  (let ((existing-contribution (map-get? pool-contributions {contributor: tx-sender, category: category}))
+        (existing-pool (default-to {total-funds: u0, total-contributors: u0, claims-paid: u0, pool-active: true} (map-get? insurance-pools category))))
+    (begin
+      (asserts! (> amount u0) ERR-INVALID-CONTRIBUTION)
+      (asserts! (get pool-active existing-pool) ERR-POOL-NOT-FOUND)
+      (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+      (match existing-contribution
+        contribution
+        (map-set pool-contributions {contributor: tx-sender, category: category} (merge contribution {
+          amount: (+ (get amount contribution) amount)
+        }))
+        (map-set pool-contributions {contributor: tx-sender, category: category} {
+          amount: amount,
+          join-block: stacks-block-height,
+          rewards-earned: u0,
+          active: true
+        })
+      )
+      (map-set insurance-pools category (merge existing-pool {
+        total-funds: (+ (get total-funds existing-pool) amount),
+        total-contributors: (if (is-none existing-contribution) (+ (get total-contributors existing-pool) u1) (get total-contributors existing-pool))
+      }))
+      (ok true)
+    )
+  )
+)
+
+(define-public (process-insured-claim (claim-id uint) (compensation-amount uint))
+  (match (map-get? warranty-claims claim-id)
+    claim
+    (let ((warranty-id (get warranty-id claim)))
+      (match (map-get? warranties warranty-id)
+        warranty
+        (match (map-get? product-registry (get product-id warranty))
+          product
+          (let ((category (get category product))
+                (pool (unwrap! (map-get? insurance-pools category) ERR-POOL-NOT-FOUND)))
+            (begin
+              (asserts! (is-eq tx-sender (get seller warranty)) ERR-NOT-AUTHORIZED)
+              (asserts! (is-eq (get status claim) "pending") ERR-CLAIM-ALREADY-PROCESSED)
+              (asserts! (>= (get total-funds pool) compensation-amount) ERR-INSUFFICIENT-POOL-FUNDS)
+              (try! (as-contract (stx-transfer? compensation-amount tx-sender (get claimant claim))))
+              (map-set warranty-claims claim-id (merge claim {
+                status: "approved",
+                resolution: "Compensated from insurance pool"
+              }))
+              (map-set insurance-pools category (merge pool {
+                total-funds: (- (get total-funds pool) compensation-amount),
+                claims-paid: (+ (get claims-paid pool) u1)
+              }))
+              (ok true)
+            )
+          )
+          ERR-INVALID-PRODUCT
+        )
+        ERR-NFT-NOT-FOUND
+      )
+    )
+    ERR-CLAIM-NOT-FOUND
   )
 )
