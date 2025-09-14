@@ -530,3 +530,104 @@
     ERR-CLAIM-NOT-FOUND
   )
 )
+
+
+(define-map transfer-history
+  uint
+  (list 20 {owner: principal, transfer-block: uint, transfer-price: uint})
+)
+
+(define-map transfer-reputation
+  principal
+  {total-transfers: uint, suspicious-activity: uint, trust-score: uint}
+)
+
+(define-read-only (get-transfer-history (warranty-id uint))
+  (map-get? transfer-history warranty-id)
+)
+
+(define-read-only (get-transfer-reputation (user principal))
+  (default-to {total-transfers: u0, suspicious-activity: u0, trust-score: u100} 
+    (map-get? transfer-reputation user))
+)
+
+(define-read-only (verify-ownership-chain (warranty-id uint) (claimed-owner principal))
+  (match (map-get? transfer-history warranty-id)
+    history
+    (match (element-at history (- (len history) u1))
+      last-transfer
+      (is-eq (get owner last-transfer) claimed-owner)
+      false
+    )
+    (match (nft-get-owner? warranty-nft warranty-id)
+      current-owner (is-eq current-owner claimed-owner)
+      false
+    )
+  )
+)
+
+(define-read-only (calculate-transfer-velocity (warranty-id uint))
+  (match (map-get? transfer-history warranty-id)
+    history
+    (let ((transfer-count (len history)))
+      (if (> transfer-count u1)
+        (match (element-at history u0)
+          first-transfer
+          (match (element-at history (- transfer-count u1))
+            last-transfer
+            (let ((time-span (- (get transfer-block last-transfer) 
+                               (get transfer-block first-transfer))))
+              (if (> time-span u0) (/ transfer-count time-span) u0)
+            )
+            u0
+          )
+          u0
+        )
+        u0
+      )
+    )
+    u0
+  )
+)
+
+(define-public (record-transfer-with-price (warranty-id uint) (recipient principal) (transfer-price uint))
+  (let ((current-history (default-to (list) (map-get? transfer-history warranty-id)))
+        (sender-rep (get-transfer-reputation tx-sender))
+        (recipient-rep (get-transfer-reputation recipient)))
+    (begin
+      (asserts! (is-eq (unwrap-panic (nft-get-owner? warranty-nft warranty-id)) tx-sender) ERR-NOT-AUTHORIZED)
+      
+      (try! (nft-transfer? warranty-nft warranty-id tx-sender recipient))
+      
+      (map-set transfer-history warranty-id 
+        (unwrap-panic (as-max-len? 
+          (append current-history {
+            owner: recipient,
+            transfer-block: stacks-block-height,
+            transfer-price: transfer-price
+          })
+          u20
+        ))
+      )
+      
+      (map-set transfer-reputation tx-sender (merge sender-rep {
+        total-transfers: (+ (get total-transfers sender-rep) u1)
+      }))
+      
+      (map-set transfer-reputation recipient (merge recipient-rep {
+        total-transfers: (+ (get total-transfers recipient-rep) u1)
+      }))
+      
+      (if (> (calculate-transfer-velocity warranty-id) u5)
+        (map-set transfer-reputation tx-sender (merge sender-rep {
+          suspicious-activity: (+ (get suspicious-activity sender-rep) u1),
+          trust-score: (if (>= (get trust-score sender-rep) u10) 
+                        (- (get trust-score sender-rep) u10) u0)
+        }))
+        true
+      )
+      
+      (ok true)
+    )
+  )
+)
