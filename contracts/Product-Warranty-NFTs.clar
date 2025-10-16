@@ -631,3 +631,89 @@
     )
   )
 )
+
+
+(define-constant ERR-RECALL-NOT-FOUND (err u120))
+
+(define-data-var recall-counter uint u0)
+
+(define-map recalls
+  uint
+  {
+    product-id: (string-ascii 64),
+    issuer: principal,
+    reason: (string-ascii 256),
+    action: (string-ascii 64),
+    active: bool,
+    announced-block: uint
+  }
+)
+
+(define-map recall-redemptions
+  {recall-id: uint, warranty-id: uint}
+  bool
+)
+
+(define-read-only (get-recall (recall-id uint))
+  (map-get? recalls recall-id)
+)
+
+(define-read-only (is-warranty-affected-by-recall (warranty-id uint) (recall-id uint))
+  (match (map-get? recalls recall-id)
+    recall-data
+    (match (map-get? warranties warranty-id)
+      warranty-data
+      (and (get active recall-data) (is-eq (get product-id warranty-data) (get product-id recall-data)))
+      false
+    )
+    false
+  )
+)
+
+(define-read-only (has-redeemed-recall (warranty-id uint) (recall-id uint))
+  (is-some (map-get? recall-redemptions {recall-id: recall-id, warranty-id: warranty-id}))
+)
+
+(define-public (announce-recall (product-id (string-ascii 64)) (reason (string-ascii 256)) (action (string-ascii 64)))
+  (let ((recall-id (+ (var-get recall-counter) u1)))
+    (match (map-get? product-registry product-id)
+      product-data
+      (begin
+        (asserts! (is-eq tx-sender (get manufacturer product-data)) ERR-NOT-AUTHORIZED)
+        (map-set recalls recall-id {
+          product-id: product-id,
+          issuer: tx-sender,
+          reason: reason,
+          action: action,
+          active: true,
+          announced-block: stacks-block-height
+        })
+        (var-set recall-counter recall-id)
+        (ok recall-id)
+      )
+      ERR-INVALID-PRODUCT
+    )
+  )
+)
+
+(define-public (redeem-recall (warranty-id uint) (recall-id uint))
+  (begin
+    (asserts! (is-eq (unwrap! (nft-get-owner? warranty-nft warranty-id) ERR-NFT-NOT-FOUND) tx-sender) ERR-NOT-AUTHORIZED)
+    (asserts! (is-warranty-affected-by-recall warranty-id recall-id) ERR-INVALID-PRODUCT)
+    (asserts! (is-none (map-get? recall-redemptions {recall-id: recall-id, warranty-id: warranty-id})) ERR-ALREADY-EXISTS)
+    (map-set recall-redemptions {recall-id: recall-id, warranty-id: warranty-id} true)
+    (ok true)
+  )
+)
+
+(define-public (close-recall (recall-id uint))
+  (match (map-get? recalls recall-id)
+    recall-data
+    (begin
+      (asserts! (is-eq tx-sender (get issuer recall-data)) ERR-NOT-AUTHORIZED)
+      (map-set recalls recall-id (merge recall-data {active: false}))
+      (ok true)
+    )
+    ERR-RECALL-NOT-FOUND
+  )
+)
