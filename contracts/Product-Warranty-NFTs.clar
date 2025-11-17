@@ -23,6 +23,13 @@
 (define-constant ERR-INVALID-CONTRIBUTION (err u111))
 (define-constant ERR-WITHDRAWAL-DENIED (err u112))
 
+(define-constant ERR-BUNDLE-NOT-FOUND (err u130))
+(define-constant ERR-INVALID-BUNDLE-SIZE (err u131))
+(define-constant ERR-WARRANTY-ALREADY-BUNDLED (err u132))
+(define-constant ERR-BUNDLE-LIMIT-REACHED (err u133))
+
+(define-data-var bundle-counter uint u0)
+
 (define-map warranties
   uint
   {
@@ -715,5 +722,99 @@
       (ok true)
     )
     ERR-RECALL-NOT-FOUND
+  )
+)
+
+
+(define-map warranty-bundles
+  uint
+  {
+    owner: principal,
+    warranty-ids: (list 10 uint),
+    bundle-type: (string-ascii 32),
+    created-block: uint,
+    discount-percentage: uint,
+    active: bool
+  }
+)
+
+(define-map warranty-to-bundle
+  uint
+  uint
+)
+
+(define-read-only (get-bundle (bundle-id uint))
+  (map-get? warranty-bundles bundle-id)
+)
+
+(define-read-only (get-warranty-bundle-id (warranty-id uint))
+  (map-get? warranty-to-bundle warranty-id)
+)
+
+(define-read-only (calculate-bundle-benefits (warranty-count uint))
+  (if (>= warranty-count u5)
+    u20
+    (if (>= warranty-count u3)
+      u10
+      u5
+    )
+  )
+)
+
+(define-public (create-warranty-bundle (warranty-ids (list 10 uint)) (bundle-type (string-ascii 32)))
+  (let ((bundle-id (+ (var-get bundle-counter) u1))
+        (warranty-count (len warranty-ids)))
+    (begin
+      (asserts! (and (>= warranty-count u2) (<= warranty-count u10)) ERR-INVALID-BUNDLE-SIZE)
+      (asserts! (fold check-warranty-ownership warranty-ids true) ERR-NOT-AUTHORIZED)
+      (asserts! (fold check-warranty-not-bundled warranty-ids true) ERR-WARRANTY-ALREADY-BUNDLED)
+      (fold link-warranty-to-bundle warranty-ids bundle-id)
+      (map-set warranty-bundles bundle-id {
+        owner: tx-sender,
+        warranty-ids: warranty-ids,
+        bundle-type: bundle-type,
+        created-block: stacks-block-height,
+        discount-percentage: (calculate-bundle-benefits warranty-count),
+        active: true
+      })
+      (var-set bundle-counter bundle-id)
+      (ok bundle-id)
+    )
+  )
+)
+
+(define-private (check-warranty-ownership (warranty-id uint) (previous-result bool))
+  (and previous-result 
+    (is-eq (nft-get-owner? warranty-nft warranty-id) (some tx-sender)))
+)
+
+(define-private (check-warranty-not-bundled (warranty-id uint) (previous-result bool))
+  (and previous-result (is-none (map-get? warranty-to-bundle warranty-id)))
+)
+
+(define-private (link-warranty-to-bundle (warranty-id uint) (bundle-id uint))
+  (begin
+    (map-set warranty-to-bundle warranty-id bundle-id)
+    bundle-id
+  )
+)
+
+(define-public (dissolve-bundle (bundle-id uint))
+  (match (map-get? warranty-bundles bundle-id)
+    bundle
+    (begin
+      (asserts! (is-eq tx-sender (get owner bundle)) ERR-NOT-AUTHORIZED)
+      (fold unlink-warranty-from-bundle (get warranty-ids bundle) true)
+      (map-set warranty-bundles bundle-id (merge bundle {active: false}))
+      (ok true)
+    )
+    ERR-BUNDLE-NOT-FOUND
+  )
+)
+
+(define-private (unlink-warranty-from-bundle (warranty-id uint) (acc bool))
+  (begin
+    (map-delete warranty-to-bundle warranty-id)
+    true
   )
 )
